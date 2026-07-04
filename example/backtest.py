@@ -1,7 +1,7 @@
 """固定评估器（fixed evaluator）—— 跑一次回测，得到一个分数。
 
 职责：
-1. 用环境变量里的聚宽账号认证，拉取（并缓存）日线数据；
+1. 从腾讯财经公开接口拉取（并缓存）前复权日线，免认证、可取多年历史；
 2. 逐日调用 ``strategy.decide(...)``，模拟满仓/空仓切换、扣减聚宽口径的手续费；
 3. 计算 Sharpe / Sortino / 年化 / 最大回撤等指标，汇成**单一分数**。
 
@@ -10,20 +10,19 @@
     score = Sortino
 
 ⚠️ 本文件是固定评估口径，HL 循环**不允许修改**它。要提分只能改 strategy.py。
-若评估器本身坏了（如认证失败、数据缺口），停下来报告，不要靠改基准绕过。
+若评估器本身坏了（如接口不可用、数据缺口），停下来报告，不要靠改基准绕过。
 
-运行：
-    export JOINQUANT_ACCOUNT=...        # 聚宽账号
-    export JOINQUANT_PASSWORD=...       # 聚宽密码
+运行（无需任何凭证）：
     python backtest.py                  # 全窗口打分（HL 研究用）
-    python backtest.py --holdout        # 样本内 vs 尾部 holdout（终验前的样本外确认）
+    python backtest.py --holdout        # 样本内 vs 尾部 holdout（样本外确认）
 """
 
 from __future__ import annotations
 
+import json
 import math
-import os
 import sys
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -35,7 +34,7 @@ import strategy
 # 固定研究口径（FIXED —— 不要为了提分而修改）
 # ============================================================
 SECURITY = "510300.XSHG"          # 标的：沪深300ETF（可交易，对齐实盘）
-START_DATE = "2025-03-01"         # 回测区间（落在账号数据权限窗口内）
+START_DATE = "2018-01-01"         # 多年回测区间（腾讯前复权日线，覆盖多轮牛熊）
 END_DATE = "2026-02-28"
 INITIAL_CASH = 100_000.0          # 初始资金：个人实盘 10 万
 TRADING_DAYS_PER_YEAR = 252
@@ -45,9 +44,9 @@ COMMISSION_RATE = 0.0003
 STAMP_TAX_RATE = 0.001
 MIN_COMMISSION = 5.0
 
-# 一年数据下的尾部 holdout 比例：最近约 20%（~2.4 个月）留作样本外确认。
-# 说明：低频策略 + 一年数据，holdout 交易稀薄，仅作「run-once」方向性确认，
-# 不作硬性否决；真正的实盘级终验在聚宽平台完成（见 jq_strategy_export.py）。
+# 尾部 holdout 比例：最近约 20% 留作 run-once 样本外确认。
+# 多年区间下 holdout 覆盖 ~1.5 年，交易样本较充足，可作方向性确认；
+# 实盘级终验仍在聚宽平台完成（见 jq_strategy_export.py）。
 HOLDOUT_FRAC = 0.20
 
 CACHE_DIR = Path(__file__).parent / ".cache"
@@ -66,32 +65,69 @@ class Metrics:
 
 
 # ------------------------------------------------------------
-# 数据：认证 + 拉取 + 本地缓存
+# 数据：腾讯财经前复权日线 + 本地缓存
 # ------------------------------------------------------------
+# 腾讯行情接口约定：交易所前缀（6/5 开头为上交所 sh，其余深交所 sz）。
+_TENCENT_PAGE = 800          # 单次可靠返回的最大日线条数（经验值，>800 接口异常）
+_TENCENT_MAX_PAGES = 30      # 分页安全上限，防止意外死循环
+
+
+def _tencent_symbol(security: str) -> str:
+    code = security.split(".")[0]          # "510300.XSHG" -> "510300"
+    market = "sh" if code.startswith(("6", "5")) else "sz"
+    return f"{market}{code}"
+
+
+def _fetch_page(symbol: str, end: str, count: int) -> list:
+    """取截至 ``end`` 往前 ``count`` 根前复权日线，返回原始 kline 行列表。"""
+    url = (
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?_var=k&param={symbol},day,,{end},{count},qfq"
+    )
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read().decode("utf-8")
+    payload = json.loads(raw[raw.index("=") + 1:])
+    sd = payload.get("data", {}).get(symbol, {})
+    return (sd.get("qfqday") or sd.get("day") or []) if isinstance(sd, dict) else []
+
+
 def load_prices() -> pd.DataFrame:
-    """拉取日线 OHLCV，优先读本地缓存以避免重复联网。"""
+    """拉取前复权日线（close），优先读本地缓存以避免重复联网。
+
+    数据源：腾讯财经公开接口（免认证、可取多年历史）。该接口单次最多稳定返回
+    约 800 条，故用「end 游标往前翻页」拼出多年区间。非官方接口，可能限频或
+    变更格式；若拉取失败或数据缺口，停下报告，不要靠改口径绕过。
+    """
     CACHE_DIR.mkdir(exist_ok=True)
     cache_file = CACHE_DIR / f"{SECURITY}_{START_DATE}_{END_DATE}.pkl"
     if cache_file.exists():
         return pd.read_pickle(cache_file)
 
-    account = os.environ.get("JOINQUANT_ACCOUNT")
-    password = os.environ.get("JOINQUANT_PASSWORD")
-    if not account or not password:
-        raise SystemExit(
-            "缺少聚宽凭证。请先设置环境变量：\n"
-            "  export JOINQUANT_ACCOUNT=<你的聚宽账号>\n"
-            "  export JOINQUANT_PASSWORD=<你的聚宽密码>"
-        )
+    symbol = _tencent_symbol(SECURITY)
+    rows: dict[str, float] = {}            # date_str -> close，按日期去重
+    end = END_DATE
+    for _ in range(_TENCENT_MAX_PAGES):
+        klines = _fetch_page(symbol, end, _TENCENT_PAGE)
+        if not klines:
+            break
+        for r in klines:
+            rows[r[0]] = float(r[2])       # r[0]=date, r[2]=close
+        earliest = klines[0][0]
+        if earliest <= START_DATE:
+            break
+        end = earliest                     # 下一页以本页最早日为界，重叠一日靠去重消化
+    if not rows:
+        raise SystemExit(f"腾讯接口未取到 {symbol} 的数据（区间 {START_DATE}~{END_DATE}）。")
 
-    import jqdatasdk as jq
-
-    jq.auth(account, password)
-    df = jq.get_price(
-        SECURITY, start_date=START_DATE, end_date=END_DATE, frequency="daily"
-    )
-    if df is None or df.empty:
-        raise SystemExit(f"未取到 {SECURITY} 在 {START_DATE}~{END_DATE} 的数据。")
+    df = pd.DataFrame(
+        [{"date": pd.to_datetime(d), "close": c} for d, c in rows.items()]
+    ).sort_values("date").reset_index(drop=True)
+    df = df[(df["date"] >= START_DATE) & (df["date"] <= END_DATE)].reset_index(drop=True)
+    if df.empty:
+        raise SystemExit(f"腾讯接口返回 {symbol} 数据，但落在 {START_DATE}~{END_DATE} 内为空。")
     df.to_pickle(cache_file)
     return df
 
@@ -280,7 +316,7 @@ def main() -> None:
         print()
         _print_metrics(f"尾部 holdout（后 {n - split} 日，run-once）", ho_m)
         print("=" * 48)
-        print("注：一年数据下 holdout 交易稀薄，仅作方向性确认，非硬门槛；")
+        print("注：holdout 仅作 run-once 方向性确认，不作硬门槛；")
         print("    实盘级终验请用 jq_strategy_export.py 在聚宽平台跑全窗口。")
         return
 
