@@ -20,9 +20,17 @@ from __future__ import annotations
 
 import pandas as pd
 
+# 下面「STRATEGY CORE」标记之间的内容 = 可移植策略核心（唯一事实源），
+# 由 scripts/export_jq.py 原样提取注入聚宽脚本。
+# 约束：只依赖 pandas；不做文件 IO / 联网 / 本地 import，
+# 以保证本地回测器与聚宽平台跑的是同一份信号逻辑。
+# >>> STRATEGY CORE >>>
 # —— 可调参数：启发式探索的搜索空间 ——
 SHORT_WINDOW = 10   # 快线窗口 n1（基线 5）
 LONG_WINDOW = 20    # 慢线窗口 n2（基线 10）
+
+# decide() 需要的最大历史长度（已完成 bar 数）；聚宽适配层据此取数。
+LOOKBACK = LONG_WINDOW
 
 
 def decide(closes: pd.Series) -> str:
@@ -45,3 +53,4 @@ def decide(closes: pd.Series) -> str:
     if ma_short < ma_long:
         return "sell"
     return "hold"
+# <<< STRATEGY CORE <<<

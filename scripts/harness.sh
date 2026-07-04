@@ -25,20 +25,28 @@ else
   echo "[harness] (跳过 git diff --check：当前目录不是 git 仓库，请先 git init)"
 fi
 
-# ---- 2. Lint --------------------------------------------------------------
-# TODO: 填入你项目的 lint 命令，例如：
-#   echo "[harness] lint";        npm run lint
-#   echo "[harness] lint";        ruff check .
+# 选择可用的 Python 解释器（语法检查/漂移检查用，仅需标准库）。
+PY="${PYTHON:-python3}"
+if ! command -v "${PY}" >/dev/null 2>&1; then
+  PY="python"
+fi
 
-# ---- 3. 类型检查 -----------------------------------------------------------
-# TODO: 填入 typecheck 命令，例如：
-#   echo "[harness] typecheck";   npx tsc --noEmit
-#   echo "[harness] typecheck";   mypy src
+# ---- 2. 语法检查（py_compile，栈内 Python 文件）------------------------------
+echo "[harness] py_compile"
+"${PY}" -m py_compile \
+  example/strategy.py \
+  example/backtest.py \
+  example/jq_strategy_export.py \
+  scripts/export_jq.py
+
+# ---- 3. 聚宽导出漂移检查 ----------------------------------------------------
+# 保证 example/jq_strategy_export.py 与 strategy.py/backtest.py 的核心一致，
+# 防止「本地改了策略、聚宽脚本忘同步」导致终验跑的不是同一份逻辑。
+echo "[harness] export_jq drift check"
+"${PY}" scripts/export_jq.py --check
 
 # ---- 4. 单元测试 -----------------------------------------------------------
-# TODO: 填入测试命令（接受透传参数 "$@"），例如：
-#   echo "[harness] test";        npm test -- "$@"
-#   echo "[harness] test";        pytest -q "$@"
+# TODO: 暂无自动化单测；策略正确性依赖固定回测器 + 聚宽终验（见 docs/design）。
 
 # ---- 5. 构建（可选）--------------------------------------------------------
 # TODO: 填入构建命令，例如：
