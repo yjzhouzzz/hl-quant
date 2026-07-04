@@ -69,8 +69,13 @@ def market_open(context):
     if len(closes) < LOOKBACK:
         return
     signal = decide(closes)
-    if signal == "buy":
+    # 幂等门控：只在需要切换持仓状态时下单，对齐本地 backtest.py 的
+    # 「shares==0 才买、shares>0 才卖」。否则满仓时每日重复委托微调、空仓时
+    # 反复发清仓单，会刷「下单数量为0」「开仓数量不能小于100」等报错，
+    # 并引入本地回测没有的每日调仓噪声，导致与 holdout 结果偏离。
+    position = context.portfolio.positions[SECURITY].total_amount
+    if signal == "buy" and position == 0:
         order_target_value(SECURITY, context.portfolio.total_value)
-    elif signal == "sell":
+    elif signal == "sell" and position > 0:
         order_target(SECURITY, 0)
-    # hold: 维持现状，不下单
+    # hold 或持仓状态无需改变：不下单
