@@ -1,8 +1,9 @@
 """固定评估器（fixed evaluator）—— 跑一次回测，得到一个分数。
 
 职责：
-1. 从腾讯财经公开接口拉取（并缓存）前复权日线，免认证、可取多年历史；
-2. 逐日调用 ``strategy.decide(...)``，模拟满仓/空仓切换、扣减聚宽口径的手续费；
+1. 从腾讯财经公开接口拉取（并缓存）前复权日线 OHLC，免认证、可取多年历史；
+2. 用「截至今日收盘」算信号、**次日开盘成交**，模拟满仓/空仓切换，扣减聚宽口径
+   的手续费、100 股整手、滑点（对齐聚宽实盘约束，避免收盘成交的乐观偏差）；
 3. 计算 Sharpe / Sortino / 年化 / 最大回撤等指标，汇成**单一分数**。
 
 评分口径：
@@ -43,6 +44,13 @@ TRADING_DAYS_PER_YEAR = 252
 COMMISSION_RATE = 0.0003
 STAMP_TAX_RATE = 0.001
 MIN_COMMISSION = 5.0
+
+# 实盘约束（对齐聚宽）：
+#   - LOT_SIZE：A 股 100 股整手，买入向下取整；
+#   - SLIPPAGE：聚宽默认 PriceRelatedSlippage(0.00246)，买入价上浮、卖出价下浮各半；
+#   - 成交时点：当日收盘算信号、次日开盘撮合（故 T+1「买入当日不可卖」天然满足）。
+LOT_SIZE = 100
+SLIPPAGE = 0.00246
 
 # 尾部 holdout 比例：最近约 20% 留作 run-once 样本外确认。
 # 多年区间下 holdout 覆盖 ~1.5 年，交易样本较充足，可作方向性确认；
@@ -95,26 +103,30 @@ def _fetch_page(symbol: str, end: str, count: int) -> list:
 
 
 def load_prices() -> pd.DataFrame:
-    """拉取前复权日线（close），优先读本地缓存以避免重复联网。
+    """拉取前复权日线 OHLC（open/close），优先读本地缓存以避免重复联网。
 
     数据源：腾讯财经公开接口（免认证、可取多年历史）。该接口单次最多稳定返回
     约 800 条，故用「end 游标往前翻页」拼出多年区间。非官方接口，可能限频或
     变更格式；若拉取失败或数据缺口，停下报告，不要靠改口径绕过。
+
+    说明：信号用 close 计算，成交用**次日 open**。均线/成交都在前复权口径下，
+    分红作为「按比例再投资」隐含在前复权价里（与聚宽「真实价+现金分红」存在
+    二阶残差，见 docs/guide/common-pitfalls.md）。
     """
     CACHE_DIR.mkdir(exist_ok=True)
-    cache_file = CACHE_DIR / f"{SECURITY}_{START_DATE}_{END_DATE}.pkl"
+    cache_file = CACHE_DIR / f"{SECURITY}_{START_DATE}_{END_DATE}_ohlc.pkl"
     if cache_file.exists():
         return pd.read_pickle(cache_file)
 
     symbol = _tencent_symbol(SECURITY)
-    rows: dict[str, float] = {}            # date_str -> close，按日期去重
+    rows: dict[str, tuple] = {}            # date_str -> (open, close)，按日期去重
     end = END_DATE
     for _ in range(_TENCENT_MAX_PAGES):
         klines = _fetch_page(symbol, end, _TENCENT_PAGE)
         if not klines:
             break
         for r in klines:
-            rows[r[0]] = float(r[2])       # r[0]=date, r[2]=close
+            rows[r[0]] = (float(r[1]), float(r[2]))   # r[0]=date, r[1]=open, r[2]=close
         earliest = klines[0][0]
         if earliest <= START_DATE:
             break
@@ -123,7 +135,7 @@ def load_prices() -> pd.DataFrame:
         raise SystemExit(f"腾讯接口未取到 {symbol} 的数据（区间 {START_DATE}~{END_DATE}）。")
 
     df = pd.DataFrame(
-        [{"date": pd.to_datetime(d), "close": c} for d, c in rows.items()]
+        [{"date": pd.to_datetime(d), "open": o, "close": c} for d, (o, c) in rows.items()]
     ).sort_values("date").reset_index(drop=True)
     df = df[(df["date"] >= START_DATE) & (df["date"] <= END_DATE)].reset_index(drop=True)
     if df.empty:
@@ -133,40 +145,13 @@ def load_prices() -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# 回测：逐日模拟满仓 / 空仓切换
+# 回测：全窗口打分（复用分段撮合 _simulate，warmup=0）
 # ------------------------------------------------------------
 def run_backtest(prices: pd.DataFrame) -> Metrics:
-    closes = prices["close"].reset_index(drop=True)
-
-    cash = INITIAL_CASH
-    shares = 0.0
-    entry_cost = 0.0          # 当前持仓的买入总成本（含手续费），用于胜率统计
-    equity_curve: list[float] = []
-    closed_trades: list[float] = []   # 每笔已平仓交易的盈亏
-
-    for i in range(len(closes)):
-        price = float(closes.iloc[i])
-        # 只用「截至今日收盘」的信息决策，不使用未来数据
-        signal = strategy.decide(closes.iloc[: i + 1])
-
-        if signal == "buy" and shares == 0.0:
-            commission = max(cash * COMMISSION_RATE, MIN_COMMISSION)
-            invest = cash - commission
-            shares = invest / price
-            entry_cost = cash            # 全部现金投入
-            cash = 0.0
-        elif signal == "sell" and shares > 0.0:
-            proceeds = shares * price
-            commission = max(proceeds * COMMISSION_RATE, MIN_COMMISSION)
-            tax = proceeds * STAMP_TAX_RATE
-            cash = proceeds - commission - tax
-            closed_trades.append(cash - entry_cost)
-            shares = 0.0
-            entry_cost = 0.0
-
-        equity_curve.append(cash + shares * price)
-
-    return _compute_metrics(equity_curve, closed_trades)
+    equity_curve, closed_trades, start = _simulate(
+        prices["open"], prices["close"], warmup=0
+    )
+    return _compute_metrics(equity_curve, closed_trades, start)
 
 
 def _compute_metrics(
@@ -223,44 +208,65 @@ def _compute_metrics(
 # ------------------------------------------------------------
 # 分段回测（holdout 验证用）：在任意连续切片上跑，warmup 段只喂历史不计分
 # ------------------------------------------------------------
-def _simulate(closes: pd.Series, warmup: int = 0) -> tuple[list[float], list[float], float]:
-    """在一段收盘价上模拟满仓/空仓，返回（计分段净值、计分段平仓盈亏、计分段起始净值）。
+def _simulate(
+    opens: pd.Series, closes: pd.Series, warmup: int = 0
+) -> tuple[list[float], list[float], float]:
+    """在一段 OHLC 上模拟满仓/空仓，返回（计分段净值、计分段平仓盈亏、计分段起始净值）。
+
+    成交口径（对齐聚宽实盘约束）：当日收盘算信号、**次日开盘撮合**，含滑点、100 股整手。
+    因买入日与卖出日必不相同，T+1「买入当日不可卖」天然满足。净值按收盘估值。
 
     warmup：前 ``warmup`` 根 bar 仅用于喂给 ``decide`` 计算均线、让持仓「热身」，
     其净值与交易不计入结果，从而保证 holdout 段的信号有足够历史、且样本外统计干净。
     """
+    opens = opens.reset_index(drop=True)
     closes = closes.reset_index(drop=True)
     cash = INITIAL_CASH
     shares = 0.0
-    entry_cost = 0.0
+    entry_cost = 0.0                              # 当前持仓买入总成本（含佣金），用于胜率
     equity_curve: list[float] = []
     closed_trades: list[float] = []
     starting_equity = INITIAL_CASH
+    pending = "hold"                              # 昨日收盘产生、待今日开盘执行的信号
 
     for i in range(len(closes)):
-        price = float(closes.iloc[i])
-        signal = strategy.decide(closes.iloc[: i + 1])
+        open_price = float(opens.iloc[i])
+        close_price = float(closes.iloc[i])
 
-        if signal == "buy" and shares == 0.0:
-            commission = max(cash * COMMISSION_RATE, MIN_COMMISSION)
-            invest = cash - commission
-            shares = invest / price
-            entry_cost = cash
-            cash = 0.0
-        elif signal == "sell" and shares > 0.0:
-            proceeds = shares * price
+        # 1) 执行昨日信号：今日开盘撮合（滑点 + 100 股整手）
+        if pending == "buy" and shares == 0.0:
+            exec_price = open_price * (1.0 + SLIPPAGE / 2.0)
+            lots = int(cash / (exec_price * LOT_SIZE * (1.0 + COMMISSION_RATE)))
+            while lots > 0:                       # 佣金导致超支则减一手重试
+                qty = lots * LOT_SIZE
+                cost = qty * exec_price
+                commission = max(cost * COMMISSION_RATE, MIN_COMMISSION)
+                if cost + commission <= cash:
+                    shares = qty
+                    entry_cost = cost + commission
+                    cash -= entry_cost
+                    break
+                lots -= 1
+        elif pending == "sell" and shares > 0.0:
+            exec_price = open_price * (1.0 - SLIPPAGE / 2.0)
+            proceeds = shares * exec_price
             commission = max(proceeds * COMMISSION_RATE, MIN_COMMISSION)
             tax = proceeds * STAMP_TAX_RATE
-            cash = proceeds - commission - tax
+            sell_net = proceeds - commission - tax
+            cash += sell_net
             if i >= warmup:                       # 只统计计分段平仓的交易
-                closed_trades.append(cash - entry_cost)
+                closed_trades.append(sell_net - entry_cost)
             shares = 0.0
             entry_cost = 0.0
 
+        # 2) 今日收盘算信号 → 挂到明日开盘执行（不使用未来数据）
+        pending = strategy.decide(closes.iloc[: i + 1])
+
+        # 3) 收盘估值记净值
         if i == warmup - 1:                       # 计分段起点净值（热身结束时）
-            starting_equity = cash + shares * price
+            starting_equity = cash + shares * close_price
         if i >= warmup:
-            equity_curve.append(cash + shares * price)
+            equity_curve.append(cash + shares * close_price)
 
     return equity_curve, closed_trades, starting_equity
 
@@ -271,16 +277,19 @@ def evaluate_holdout(prices: pd.DataFrame) -> tuple[Metrics, Metrics]:
     holdout 段带 ``LOOKBACK`` 根只读热身 bar，保证均线信号有完整历史。
     返回 (样本内 Metrics, holdout Metrics)。
     """
+    opens = prices["open"].reset_index(drop=True)
     closes = prices["close"].reset_index(drop=True)
     n = len(closes)
     split = int(n * (1.0 - HOLDOUT_FRAC))
 
-    in_curve, in_trades, in_start = _simulate(closes.iloc[:split], warmup=0)
+    in_curve, in_trades, in_start = _simulate(
+        opens.iloc[:split], closes.iloc[:split], warmup=0
+    )
     in_metrics = _compute_metrics(in_curve, in_trades, in_start)
 
     warmup = min(strategy.LOOKBACK, split)
     ho_curve, ho_trades, ho_start = _simulate(
-        closes.iloc[split - warmup:], warmup=warmup
+        opens.iloc[split - warmup:], closes.iloc[split - warmup:], warmup=warmup
     )
     ho_metrics = _compute_metrics(ho_curve, ho_trades, ho_start)
     return in_metrics, ho_metrics
