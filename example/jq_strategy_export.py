@@ -18,9 +18,10 @@ SECURITY = "510300.XSHG"
 # —— 可调参数：启发式探索的搜索空间 ——
 SHORT_WINDOW = 10   # 快线窗口 n1（基线 5）
 LONG_WINDOW = 20    # 慢线窗口 n2（基线 10）
+TREND_WINDOW = 200  # 牛熊趋势线：价格站上它才视为多头结构（经典 200 日线）
 
 # decide() 需要的最大历史长度（已完成 bar 数）；聚宽适配层据此取数。
-LOOKBACK = LONG_WINDOW
+LOOKBACK = max(LONG_WINDOW, TREND_WINDOW)
 
 
 def decide(closes: pd.Series) -> str:
@@ -32,15 +33,19 @@ def decide(closes: pd.Series) -> str:
     纯函数：不读数据、不下单、不依赖任何外部状态——只看价格、只给信号。
     回测器负责把信号翻译成成交、成本与净值。
     """
-    if len(closes) < LONG_WINDOW:
+    if len(closes) < LOOKBACK:
         return "hold"
 
+    price = closes.iloc[-1]
     ma_short = closes.iloc[-SHORT_WINDOW:].mean()
     ma_long = closes.iloc[-LONG_WINDOW:].mean()
+    ma_trend = closes.iloc[-TREND_WINDOW:].mean()
 
-    if ma_short > ma_long:
+    # 多头结构（价站上 200 日线）+ 金叉 → 做多
+    if ma_short > ma_long and price > ma_trend:
         return "buy"
-    if ma_short < ma_long:
+    # 死叉 或 跌破牛熊线（空头结构）→ 空仓
+    if ma_short < ma_long or price < ma_trend:
         return "sell"
     return "hold"
 # ============================================================
