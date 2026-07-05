@@ -308,3 +308,59 @@ def _compute_xs_metrics(port: pd.Series, bench: pd.Series, holdings_log: list,
 def _bench_asof(bench: pd.Series, d) -> float | None:
     sub = bench.loc[:d]
     return float(sub.iloc[-1]) if len(sub) else None
+
+
+def run_backtest(panel: dict | None = None, bench: pd.DataFrame | None = None) -> XSMetrics:
+    """全窗口回测，返回 XSMetrics（score = IR）。panel/bench 省略则 load_panel()。"""
+    if panel is None or bench is None:
+        panel, bench = load_panel()
+    reb = set(rebalance_dates(list(bench["date"])))
+    port, benchc, log, tv, sp, sb = _simulate_xs(panel, bench, reb)
+    return _compute_xs_metrics(port, benchc, log, tv, sp, sb, panel)
+
+
+def evaluate_holdout(panel: dict | None = None, bench: pd.DataFrame | None = None) -> tuple:
+    """样本内 vs 尾部 holdout。返回 (m_in, m_out, in_start, in_end, out_start, out_end)。
+    holdout 段用 warmup 从头热身持仓，只对尾部计分。"""
+    if panel is None or bench is None:
+        panel, bench = load_panel()
+    cal = list(bench["date"])
+    split = int(len(cal) * (1 - HOLDOUT_FRAC))
+    bench_in = bench.iloc[:split].reset_index(drop=True)
+    p1, b1, l1, tv1, sp1, sb1 = _simulate_xs(panel, bench_in, set(rebalance_dates(list(bench_in["date"]))))
+    m_in = _compute_xs_metrics(p1, b1, l1, tv1, sp1, sb1, panel)
+    p2, b2, l2, tv2, sp2, sb2 = _simulate_xs(panel, bench, set(rebalance_dates(cal)), warmup_days=split)
+    m_out = _compute_xs_metrics(p2, b2, l2, tv2, sp2, sb2, panel)
+    return m_in, m_out, cal[0], cal[split - 1], cal[split], cal[-1]
+
+
+def _fmt(m: XSMetrics) -> str:
+    return (
+        f"  IR(score)     : {m.score:+.4f}\n"
+        f"  年化超额      : {m.ann_excess:+.2%}\n"
+        f"  超额最大回撤  : {m.excess_maxdd:.2%}\n"
+        f"  月度胜率      : {m.monthly_win:.1%}\n"
+        f"  超额 t 统计量 : {m.t_stat:+.2f}\n"
+        f"  年化换手(单边): {m.turnover:.2f}x\n"
+        f"  有效持仓次数  : {m.n_holdings}\n"
+        f"  单点最大贡献  : {m.top_contrib:.1%}"
+    )
+
+
+def main() -> None:
+    panel, bench = load_panel()
+    if "--holdout" in sys.argv:
+        m_in, m_out, i0, i1, o0, o1 = evaluate_holdout(panel, bench)
+        print(f"[样本内 {i0.date()}~{i1.date()}]")
+        print(_fmt(m_in))
+        print(f"\n[holdout {o0.date()}~{o1.date()}]")
+        print(_fmt(m_out))
+        print(f"\n样本内−holdout IR 分差: {m_in.score - m_out.score:+.4f}（>1.0 判过拟合）")
+    else:
+        m = run_backtest(panel, bench)
+        print(f"[全窗口 {START_DATE}~{END_DATE}] 沪深300快照={SNAPSHOT_DATE} Top{TOP_N} 月度等权")
+        print(_fmt(m))
+
+
+if __name__ == "__main__":
+    main()

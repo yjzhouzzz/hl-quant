@@ -1,5 +1,6 @@
 """横截面 v2 单元测试（纯函数为主，不联网）。"""
 
+import math
 import re
 
 from example import universe_csi300 as uni
@@ -93,3 +94,19 @@ def test_xs_metrics_basic():
     assert m.t_stat > 0
     assert 0.0 <= m.top_contrib <= 1.0
     assert m.n_holdings == 0
+
+
+def test_run_backtest_on_synthetic(monkeypatch):
+    idx = pd.bdate_range("2020-01-01", periods=120).tolist()
+    panel = {
+        "A.XSHG": _ramp(idx, 10, 0.20), "B.XSHG": _ramp(idx, 10, 0.10),
+        "C.XSHG": _ramp(idx, 10, 0.05), "D.XSHG": _ramp(idx, 10, 0.01),
+    }
+    bench = _ramp(idx, 100, 0.05)
+    monkeypatch.setattr(strategy_xs, "LOOKBACK", 5)
+    monkeypatch.setattr(strategy_xs, "SKIP", 1)
+    monkeypatch.setattr(bx, "TOP_N", 2)
+    m = bx.run_backtest(panel=panel, bench=bench)
+    assert isinstance(m, bx.XSMetrics)
+    assert math.isfinite(m.score)
+    assert m.n_holdings > 0
