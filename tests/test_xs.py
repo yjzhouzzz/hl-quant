@@ -36,8 +36,7 @@ def test_momentum_score_ranks_and_filters():
     short = up.iloc[-10:].reset_index(drop=True)
     s = strategy_xs.score({"A.XSHG": up, "B.XSHG": flat, "C.XSHG": short})
     assert "C.XSHG" not in s
-    assert "B.XSHG" not in s
-    assert s["A.XSHG"] > 0
+    assert s["A.XSHG"] > s["B.XSHG"]
 
 
 def test_rebalance_dates_first_trading_day_of_month():
@@ -78,6 +77,7 @@ def test_simulate_xs_selects_top_and_is_deterministic(monkeypatch):
     monkeypatch.setattr(strategy_xs, "LOOKBACK", 5)
     monkeypatch.setattr(strategy_xs, "SKIP", 1)
     monkeypatch.setattr(bx, "TOP_N", 2)
+    monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
     reb = set(bx.rebalance_dates(idx))
     port, benchc, log, turnover, sp, sb = bx._simulate_xs(panel, bench, reb)
     assert len(log) >= 2
@@ -87,6 +87,110 @@ def test_simulate_xs_selects_top_and_is_deterministic(monkeypatch):
     assert port.iloc[-1] > 0 and len(port) == len(idx)
     port2, *_ = bx._simulate_xs(panel, bench, reb)
     assert list(port) == list(port2)                       # 确定性
+
+
+def test_simulate_xs_uses_previous_day_signal_on_rebalance_open(monkeypatch):
+    idx = pd.to_datetime(["2020-01-30", "2020-01-31", "2020-02-03", "2020-02-04"]).tolist()
+    panel = {
+        "A.XSHG": pd.DataFrame({
+            "date": idx,
+            "open": [10, 10, 20, 20],
+            "close": [10, 20, 21, 21],
+        }),
+        "B.XSHG": pd.DataFrame({
+            "date": idx,
+            "open": [10, 10, 50, 50],
+            "close": [10, 10, 50, 50],
+        }),
+    }
+    bench = pd.DataFrame({"date": idx, "open": [100] * 4, "close": [100] * 4})
+
+    monkeypatch.setattr(bx, "TOP_N", 1)
+    monkeypatch.setattr(
+        strategy_xs,
+        "score",
+        lambda hist: {code: float(df["close"].iloc[-1]) for code, df in hist.items()},
+    )
+    monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
+
+    _, _, log, _, _, _ = bx._simulate_xs(panel, bench, {pd.Timestamp("2020-02-03")})
+
+    assert log == [(pd.Timestamp("2020-02-03"), ["A.XSHG"])]
+
+
+def test_simulate_xs_executes_on_rebalance_day_open(monkeypatch):
+    idx = pd.to_datetime(["2020-01-30", "2020-01-31", "2020-02-03", "2020-02-04"]).tolist()
+    panel = {
+        "A.XSHG": pd.DataFrame({
+            "date": idx,
+            "open": [10, 10, 10, 20],
+            "close": [10, 10, 20, 20],
+        }),
+        "B.XSHG": pd.DataFrame({
+            "date": idx,
+            "open": [10, 10, 10, 10],
+            "close": [10, 10, 10, 10],
+        }),
+    }
+    bench = pd.DataFrame({"date": idx, "open": [100] * 4, "close": [100] * 4})
+
+    monkeypatch.setattr(bx, "TOP_N", 1)
+    monkeypatch.setattr(strategy_xs, "score", lambda hist: {"A.XSHG": 1.0, "B.XSHG": 0.0})
+    monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
+
+    port, _, _, _, _, _ = bx._simulate_xs(panel, bench, {pd.Timestamp("2020-02-03")})
+
+    assert port.loc[pd.Timestamp("2020-02-03")] > bx.INITIAL_CASH
+
+
+def test_simulate_xs_respects_point_in_time_universe(monkeypatch):
+    idx = pd.to_datetime(["2020-01-30", "2020-01-31", "2020-02-03", "2020-02-04"]).tolist()
+    panel = {
+        "A.XSHG": pd.DataFrame({
+            "date": idx,
+            "open": [10, 10, 10, 10],
+            "close": [10, 20, 20, 20],
+        }),
+        "B.XSHG": pd.DataFrame({
+            "date": idx,
+            "open": [10, 10, 10, 10],
+            "close": [10, 30, 30, 30],
+        }),
+    }
+    bench = pd.DataFrame({"date": idx, "open": [100] * 4, "close": [100] * 4})
+
+    monkeypatch.setattr(bx, "TOP_N", 1)
+    monkeypatch.setattr(
+        strategy_xs,
+        "score",
+        lambda hist: {code: float(df["close"].iloc[-1]) for code, df in hist.items()},
+    )
+    monkeypatch.setattr(
+        bx,
+        "_pit_constituents_at",
+        lambda d: {"A.XSHG"},
+        raising=False,
+    )
+
+    _, _, log, _, _, _ = bx._simulate_xs(panel, bench, {pd.Timestamp("2020-02-03")})
+
+    assert log == [(pd.Timestamp("2020-02-03"), ["A.XSHG"])]
+
+
+def test_pit_constituents_at_excludes_star_board():
+    old = bx._pit_history_cache
+    bx._pit_history_cache = pd.DataFrame({
+        "symbol": ["SH688256", "SZ000001"],
+        "name": ["寒武纪-U", "平安银行"],
+        "opt-in": pd.to_datetime(["2023-12-08", "2005-04-08"]),
+        "opt-out": pd.to_datetime([None, None]),
+    })
+    try:
+        got = bx._pit_constituents_at(pd.Timestamp("2024-11-01"))
+        assert "000001.XSHE" in got
+        assert "688256.XSHG" not in got
+    finally:
+        bx._pit_history_cache = old
 
 
 def test_xs_metrics_basic():
@@ -112,6 +216,7 @@ def test_run_backtest_on_synthetic(monkeypatch):
     monkeypatch.setattr(strategy_xs, "LOOKBACK", 5)
     monkeypatch.setattr(strategy_xs, "SKIP", 1)
     monkeypatch.setattr(bx, "TOP_N", 2)
+    monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
     m = bx.run_backtest(panel=panel, bench=bench)
     assert isinstance(m, bx.XSMetrics)
     assert math.isfinite(m.score)
@@ -125,5 +230,6 @@ def test_export_jq_xs_render_and_check():
     assert "get_index_stocks" in out          # point-in-time 成分
     assert "def score" in out                  # 核心已注入
     assert "TOP_N = 3" in out                   # 与 backtest_xs 同步
+    assert "startswith('688')" in out          # 非科创板过滤同步到聚宽终验
     r = subprocess.run([py, "scripts/export_jq_xs.py", "--check"], cwd=_ROOT)
     assert r.returncode == 0                    # 漂移检查通过

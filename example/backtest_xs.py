@@ -1,7 +1,7 @@
 """固定评估器 v2（横截面选股）—— 跑一次回测，得到一个 IR 超额分数。
 
-职责：拉沪深300固定快照的腾讯前复权日线面板 + 基准 sh000300；按月度调仓、
-等权 Top-N、次日开盘成交（滑点/整手/成本），算相对基准的信息比率(IR)。
+职责：拉沪深300历史真实成分（point-in-time）的股票面板 + 基准 sh000300；按月度
+调仓、等权 Top-N、月初开盘成交（滑点/整手/成本），算相对基准的信息比率(IR)。
 
 ⚠️ 固定评估口径，HL 循环不允许修改；提分只改 strategy_xs.py。设计见
 docs/design/cross-sectional-pipeline.md。运行：
@@ -19,11 +19,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import index_constitution as ic
 import pandas as pd
 
 import strategy_xs
 from backtest import _fetch_page, _tencent_symbol  # 复用腾讯拉取（只读，不改单标的版）
-from universe_csi300 import CSI300, SNAPSHOT_DATE
+from universe_csi300 import SNAPSHOT_DATE
 
 # ============================================================
 # 固定研究口径（FIXED —— 不要为了提分而修改）
@@ -77,6 +78,12 @@ _FETCH_BACKOFF = 1.0          # 首次等待秒数，每次翻倍
 _FETCH_SLEEP = 0.4            # 每只股票之间的限速间隔
 _SINA_DATALEN = 2500          # 新浪单次最多约 2500 根日线（覆盖 2018 窗口）
 _tencent_ok: bool | None = None   # None=未探测；False 时全量走新浪，避免 300×重试
+_pit_history_cache: pd.DataFrame | None = None
+
+
+def _allow_user_market(code: str) -> bool:
+    """用户约束：非科创板实盘，排除 688xxx。"""
+    return not code.startswith("688")
 
 
 def _tencent_available() -> bool:
@@ -167,9 +174,56 @@ def _rows_to_ohlc(rows: list, start: str, end: str) -> pd.DataFrame:
     return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
 
 
+def _pit_symbol_to_code(symbol: str) -> str:
+    """`SZ000001` / `SH600000` → `000001.XSHE` / `600000.XSHG`。"""
+    if symbol.startswith("SZ"):
+        return f"{symbol[2:]}.XSHE"
+    if symbol.startswith("SH"):
+        return f"{symbol[2:]}.XSHG"
+    raise ValueError(f"未知中证成分符号格式: {symbol}")
+
+
+def _pit_history() -> pd.DataFrame:
+    """加载 CSI300 历史成分变更表，并缓存到内存。"""
+    global _pit_history_cache
+    if _pit_history_cache is None:
+        hist = ic.history("csi300").copy()
+        hist["opt-in"] = pd.to_datetime(hist["opt-in"])
+        hist["opt-out"] = pd.to_datetime(hist["opt-out"])
+        _pit_history_cache = hist
+    return _pit_history_cache
+
+
+def _pit_union_codes() -> list[str]:
+    """回测窗口内曾属于 CSI300 的全部个股并集（用于预拉价格面板）。"""
+    hist = _pit_history()
+    start = pd.Timestamp(START_DATE)
+    end = pd.Timestamp(END_DATE)
+    mask = (hist["opt-in"] <= end) & (hist["opt-out"].isna() | (hist["opt-out"] >= start))
+    return sorted(
+        {
+            code
+            for code in (_pit_symbol_to_code(sym) for sym in hist.loc[mask, "symbol"])
+            if _allow_user_market(code)
+        }
+    )
+
+
+def _pit_constituents_at(date) -> set[str]:
+    """给定日期，返回当时 CSI300 的 point-in-time 成分集合。"""
+    hist = _pit_history()
+    d = pd.Timestamp(date)
+    mask = (hist["opt-in"] <= d) & (hist["opt-out"].isna() | (hist["opt-out"] >= d))
+    return {
+        code
+        for code in (_pit_symbol_to_code(sym) for sym in hist.loc[mask, "symbol"])
+        if _allow_user_market(code)
+    }
+
+
 def _panel_cache_paths() -> tuple[Path, Path]:
     """返回 (最终缓存, 增量缓存) 路径。"""
-    stem = f"panel_csi300_{SNAPSHOT_DATE}_{START_DATE}_{END_DATE}"
+    stem = f"panel_csi300_pit_{START_DATE}_{END_DATE}"
     return CACHE_DIR / f"{stem}.pkl", CACHE_DIR / f"{stem}_partial.pkl"
 
 
@@ -200,7 +254,8 @@ def load_panel() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
             raise SystemExit("基准 sh000300 未取到数据，停止（数据源阻塞）。")
         pd.to_pickle({"panel": panel, "bench": bench}, partial)
 
-    for code in CSI300:
+    universe_all = _pit_union_codes()
+    for code in universe_all:
         if code in panel:
             continue
         df = _fetch_ohlc(_tencent_symbol(code))
@@ -209,9 +264,9 @@ def load_panel() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
         pd.to_pickle({"panel": panel, "bench": bench}, partial)
         time.sleep(_FETCH_SLEEP)
 
-    if len(panel) < 0.8 * len(CSI300):
+    if len(panel) < 0.8 * len(universe_all):
         raise SystemExit(
-            f"仅取到 {len(panel)}/{len(CSI300)} 只，疑似接口受限，停止（勿用残缺池）。\n"
+            f"仅取到 {len(panel)}/{len(universe_all)} 只，疑似接口受限，停止（勿用残缺池）。\n"
             f"增量缓存已写入 {partial}，接口恢复后重跑 load_panel() 可续拉。"
         )
     pd.to_pickle({"panel": panel, "bench": bench}, cache)
@@ -283,7 +338,10 @@ def _rebalance(cash: float, positions: dict, targets: list[str],
 
 def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
                  warmup_days: int = 0) -> tuple:
-    """逐日模拟月度等权 Top-N：调仓日收盘选股 → 次日开盘成交 → 每日收盘估值。
+    """逐日模拟月度等权 Top-N：调仓日前一交易日收盘选股 → 调仓日开盘成交 → 每日收盘估值。
+
+    这样与聚宽 `run_monthly(..., time="open") + previous_date` 对齐：在月初第一个交易日
+    开盘前，只能看到上一交易日（通常是上月最后一个交易日）已完成 bar 的信息。
 
     返回 (组合净值 Series, 基准净值 Series, 持仓日志 list[(date,[codes])],
           成交名义额合计, 计分段起始组合净值, 计分段起始基准值)。
@@ -297,7 +355,6 @@ def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
     cash = INITIAL_CASH
     positions: dict[str, float] = {}
     last_close: dict[str, float] = {}
-    pending: list[str] | None = None
     port_curve: list[float] = []
     bench_curve: list[float] = []
     holdings_log: list[tuple] = []
@@ -306,25 +363,28 @@ def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
     start_bench = bclose[cal[0]]
 
     for i, d in enumerate(cal):
-        if pending is not None:                    # 1) 执行昨日目标：今开成交
-            names = set(list(positions) + pending)
+        if d in rebalance_set and i > 0:           # 1) 今开调仓：信号只用昨收前已知信息
+            signal_date = cal[i - 1]
+            universe = _pit_constituents_at(signal_date)
+            hist = {
+                c: df[df["date"] <= signal_date]
+                for c, df in panel.items()
+                if c in universe
+            }
+            scores = strategy_xs.score(hist)
+            targets = [c for c in scores if d in popen.get(c, {})]
+            targets.sort(key=lambda c: scores[c], reverse=True)
+            targets = targets[:TOP_N]
+            names = set(list(positions) + targets)
             op = {c: popen[c][d] for c in names if d in popen.get(c, {})}
-            cash, positions, tv = _rebalance(cash, positions, pending, op)
+            cash, positions, tv = _rebalance(cash, positions, targets, op)
             if i >= warmup_days:
                 turnover_total += tv
-            pending = None
+                if targets:
+                    holdings_log.append((d, list(targets)))
         for c in list(positions):                  # 2) 更新估值兜底（停牌沿用上一收盘）
             if d in pclose.get(c, {}):
                 last_close[c] = pclose[c][d]
-        if d in rebalance_set:                      # 3) 调仓日收盘选下一批
-            hist = {c: df[df["date"] <= d] for c, df in panel.items()}
-            scores = strategy_xs.score(hist)
-            nxt = cal[i + 1] if i + 1 < len(cal) else None
-            elig = [c for c in scores if nxt is not None and nxt in popen.get(c, {})]
-            elig.sort(key=lambda c: scores[c], reverse=True)
-            pending = elig[:TOP_N]
-            if i >= warmup_days and pending:
-                holdings_log.append((d, list(pending)))
         pv = cash + sum(sh * last_close.get(c, 0.0) for c, sh in positions.items())
         if i == warmup_days:
             start_port = pv

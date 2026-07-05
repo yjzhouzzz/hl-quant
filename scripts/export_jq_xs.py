@@ -55,7 +55,7 @@ def initialize(context):
 
 def rebalance(context):
     date = context.previous_date
-    universe = get_index_stocks(BENCHMARK, date=date)   # point-in-time 成分
+    universe = [c for c in get_index_stocks(BENCHMARK, date=date) if not c.startswith('688')]
     hist = {{}}
     for code in universe:
         df = attribute_history(code, LOOKBACK, '1d', ['close'], skip_paused=True)
