@@ -19,6 +19,18 @@ def test_universe_snapshot_valid():
 
 import pandas as pd
 import backtest_xs as bx
+import strategy_xs
+
+
+def test_momentum_score_ranks_and_filters():
+    n = strategy_xs.LOOKBACK
+    idx = pd.date_range("2019-01-01", periods=n)
+    up = pd.DataFrame({"date": idx, "open": 1.0, "close": [1.0 + i * 0.01 for i in range(n)]})
+    flat = pd.DataFrame({"date": idx, "open": 1.0, "close": [1.0] * n})
+    short = up.iloc[-10:].reset_index(drop=True)
+    s = strategy_xs.score({"A.XSHG": up, "B.XSHG": flat, "C.XSHG": short})
+    assert "C.XSHG" not in s
+    assert s["A.XSHG"] > s["B.XSHG"]
 
 
 def test_rebalance_dates_first_trading_day_of_month():
