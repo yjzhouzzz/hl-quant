@@ -10,8 +10,12 @@ docs/design/cross-sectional-pipeline.md。运行：
 """
 from __future__ import annotations
 
+import json
 import math
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +72,86 @@ def rebalance_dates(trading_days: list[pd.Timestamp]) -> list[pd.Timestamp]:
 
 _TENCENT_PAGE = 800
 _TENCENT_MAX_PAGES = 30
+_FETCH_RETRIES = 5          # 腾讯接口 501/断连时指数退避重试
+_FETCH_BACKOFF = 1.0          # 首次等待秒数，每次翻倍
+_FETCH_SLEEP = 0.4            # 每只股票之间的限速间隔
+_SINA_DATALEN = 2500          # 新浪单次最多约 2500 根日线（覆盖 2018 窗口）
+_tencent_ok: bool | None = None   # None=未探测；False 时全量走新浪，避免 300×重试
+
+
+def _tencent_available() -> bool:
+    """探测腾讯是否可用；一旦 501 则本会话内不再重试。"""
+    global _tencent_ok
+    if _tencent_ok is not None:
+        return _tencent_ok
+    try:
+        _fetch_page("sh000300", END_DATE, 3)
+        _tencent_ok = True
+    except Exception:
+        _tencent_ok = False
+        print("[load_panel] 腾讯接口不可用，全量改用新浪备用源（不复权）…")
+    return _tencent_ok
+
+
+def _fetch_page_retry(symbol: str, end: str, count: int) -> list:
+    """带重试的 _fetch_page 包装：应对腾讯 501/断连等瞬时限频。"""
+    delay = _FETCH_BACKOFF
+    last_exc: Exception | None = None
+    for attempt in range(_FETCH_RETRIES):
+        try:
+            return _fetch_page(symbol, end, count)
+        except (urllib.error.HTTPError, urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt + 1 >= _FETCH_RETRIES:
+                break
+            time.sleep(delay)
+            delay *= 2
+    raise last_exc  # type: ignore[misc]
+
+
+def _fetch_ohlc_tencent(symbol: str) -> pd.DataFrame:
+    """腾讯前复权日线（主数据源）。"""
+    rows: list = []
+    end = END_DATE
+    for _ in range(_TENCENT_MAX_PAGES):
+        page = _fetch_page_retry(symbol, end, _TENCENT_PAGE)
+        if not page:
+            break
+        rows = page + rows
+        earliest = page[0][0]
+        if earliest <= START_DATE:
+            break
+        end = earliest
+        time.sleep(_FETCH_SLEEP / 2)
+    return _rows_to_ohlc(rows, START_DATE, END_DATE)
+
+
+def _fetch_ohlc_sina(symbol: str) -> pd.DataFrame:
+    """新浪日线备用源（不复权；腾讯 501 时降级）。单次 datalen 覆盖 2018 窗口。"""
+    url = (
+        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={_SINA_DATALEN}"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+    if not raw:
+        return pd.DataFrame(columns=["date", "open", "close"])
+    df = pd.DataFrame({
+        "date": pd.to_datetime([r["day"] for r in raw]),
+        "open": [float(r["open"]) for r in raw],
+        "close": [float(r["close"]) for r in raw],
+    }).sort_values("date").reset_index(drop=True)
+    return df[(df["date"] >= START_DATE) & (df["date"] <= END_DATE)].reset_index(drop=True)
+
+
+def _fetch_ohlc(symbol: str) -> pd.DataFrame:
+    """拉取 open/close 表：腾讯前复权优先；探测失败后全量新浪（不复权）。"""
+    if _tencent_available():
+        df = _fetch_ohlc_tencent(symbol)
+        if not df.empty:
+            return df
+    return _fetch_ohlc_sina(symbol)
 
 
 def _rows_to_ohlc(rows: list, start: str, end: str) -> pd.DataFrame:
@@ -83,48 +167,55 @@ def _rows_to_ohlc(rows: list, start: str, end: str) -> pd.DataFrame:
     return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
 
 
-def _fetch_ohlc(symbol: str) -> pd.DataFrame:
-    """分页拉取单个腾讯符号的多年前复权日线，返回 open/close 表。"""
-    rows: list = []
-    end = END_DATE
-    for _ in range(_TENCENT_MAX_PAGES):
-        page = _fetch_page(symbol, end, _TENCENT_PAGE)
-        if not page:
-            break
-        rows = page + rows
-        earliest = page[0][0]
-        if earliest <= START_DATE:
-            break
-        end = earliest
-    return _rows_to_ohlc(rows, START_DATE, END_DATE)
+def _panel_cache_paths() -> tuple[Path, Path]:
+    """返回 (最终缓存, 增量缓存) 路径。"""
+    stem = f"panel_csi300_{SNAPSHOT_DATE}_{START_DATE}_{END_DATE}"
+    return CACHE_DIR / f"{stem}.pkl", CACHE_DIR / f"{stem}_partial.pkl"
 
 
 def load_panel() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    """拉取股票池面板 + 基准，优先读缓存。
+    """拉取股票池面板 + 基准，优先读缓存；支持增量缓存断点续拉。
 
     返回 (panel, bench)：panel = {code: OHLC表(date/open/close)}；bench = 基准 OHLC 表。
     缺口股票（停牌久/次新不足）保留其可得区间，撮合时按日期对齐处理。
     """
     CACHE_DIR.mkdir(exist_ok=True)
-    cache = CACHE_DIR / f"panel_csi300_{SNAPSHOT_DATE}_{START_DATE}_{END_DATE}.pkl"
+    cache, partial = _panel_cache_paths()
     if cache.exists():
         obj = pd.read_pickle(cache)
         return obj["panel"], obj["bench"]
 
-    bench = _fetch_ohlc("sh000300")  # 指数 000300 非 6/5 开头，不走 _tencent_symbol
-    if bench.empty:
-        raise SystemExit("基准 sh000300 未取到数据，停止（数据源阻塞）。")
-
     panel: dict[str, pd.DataFrame] = {}
+    bench: pd.DataFrame | None = None
+    if partial.exists():
+        obj = pd.read_pickle(partial)
+        panel = obj.get("panel") or {}
+        bench = obj.get("bench")
+        print(f"[load_panel] 续拉增量缓存：已有 {len(panel)} 只"
+              + ("，基准已缓存" if bench is not None and not bench.empty else ""))
+
+    if bench is None or bench.empty:
+        bench = _fetch_ohlc("sh000300")  # 指数不走 _tencent_symbol
+        if bench.empty:
+            raise SystemExit("基准 sh000300 未取到数据，停止（数据源阻塞）。")
+        pd.to_pickle({"panel": panel, "bench": bench}, partial)
+
     for code in CSI300:
+        if code in panel:
+            continue
         df = _fetch_ohlc(_tencent_symbol(code))
         if not df.empty:
             panel[code] = df
+        pd.to_pickle({"panel": panel, "bench": bench}, partial)
+        time.sleep(_FETCH_SLEEP)
+
     if len(panel) < 0.8 * len(CSI300):
         raise SystemExit(
-            f"仅取到 {len(panel)}/{len(CSI300)} 只，疑似接口受限，停止（勿用残缺池）。"
+            f"仅取到 {len(panel)}/{len(CSI300)} 只，疑似接口受限，停止（勿用残缺池）。\n"
+            f"增量缓存已写入 {partial}，接口恢复后重跑 load_panel() 可续拉。"
         )
     pd.to_pickle({"panel": panel, "bench": bench}, cache)
+    partial.unlink(missing_ok=True)
     return panel, bench
 
 
