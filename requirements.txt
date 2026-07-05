@@ -1,3 +1,4 @@
 jqdatasdk>=1.9.0
 pandas>=1.3.0
 numpy
+pytest>=8.0
