@@ -2,8 +2,13 @@
 
 import math
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 from example import universe_csi300 as uni
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_pytest_wired():
@@ -110,3 +115,14 @@ def test_run_backtest_on_synthetic(monkeypatch):
     assert isinstance(m, bx.XSMetrics)
     assert math.isfinite(m.score)
     assert m.n_holdings > 0
+
+
+def test_export_jq_xs_render_and_check():
+    py = sys.executable
+    subprocess.run([py, "scripts/export_jq_xs.py"], cwd=_ROOT, check=True)
+    out = (_ROOT / "example" / "jq_strategy_xs_export.py").read_text(encoding="utf-8")
+    assert "get_index_stocks" in out          # point-in-time 成分
+    assert "def score" in out                  # 核心已注入
+    assert "TOP_N = 3" in out                   # 与 backtest_xs 同步
+    r = subprocess.run([py, "scripts/export_jq_xs.py", "--check"], cwd=_ROOT)
+    assert r.returncode == 0                    # 漂移检查通过

@@ -30,4 +30,4 @@ def score(history: dict) -> dict:
         if p_old > 0:
             out[code] = p_recent / p_old - 1.0
     return out
-# <<< STRATEGY CORE <<<>
+# <<< STRATEGY CORE <<<
