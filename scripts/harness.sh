@@ -37,16 +37,21 @@ echo "[harness] py_compile"
   example/strategy.py \
   example/backtest.py \
   example/jq_strategy_export.py \
-  scripts/export_jq.py
+  example/strategy_xs.py \
+  example/backtest_xs.py \
+  example/jq_strategy_xs_export.py \
+  scripts/export_jq.py \
+  scripts/export_jq_xs.py
 
 # ---- 3. 聚宽导出漂移检查 ----------------------------------------------------
 # 保证 example/jq_strategy_export.py 与 strategy.py/backtest.py 的核心一致，
 # 防止「本地改了策略、聚宽脚本忘同步」导致终验跑的不是同一份逻辑。
 echo "[harness] export_jq drift check"
 "${PY}" scripts/export_jq.py --check
+"${PY}" scripts/export_jq_xs.py --check
 
 # ---- 4. 单元测试 -----------------------------------------------------------
-# TODO: 暂无自动化单测；策略正确性依赖固定回测器 + 聚宽终验（见 docs/design）。
+echo "[harness] pytest" && "${PY}" -m pytest tests/ -q
 
 # ---- 5. 构建（可选）--------------------------------------------------------
 # TODO: 填入构建命令，例如：
