@@ -53,3 +53,30 @@ def test_rows_to_ohlc_dedup_and_sort():
     assert list(df["date"].dt.strftime("%Y-%m-%d")) == ["2020-01-02", "2020-01-03"]
     assert df.iloc[1]["close"] == 1.25   # 去重取后者
     assert df.iloc[0]["open"] == 1.0
+
+
+def _ramp(idx, start, step):
+    vals = [start + step * i for i in range(len(idx))]
+    return pd.DataFrame({"date": idx, "open": vals, "close": vals})
+
+
+def test_simulate_xs_selects_top_and_is_deterministic(monkeypatch):
+    idx = pd.bdate_range("2020-01-01", periods=90).tolist()
+    panel = {
+        "A.XSHG": _ramp(idx, 10, 0.20),   # 最强
+        "B.XSHG": _ramp(idx, 10, 0.10),
+        "C.XSHG": _ramp(idx, 10, 0.02),   # 最弱
+    }
+    bench = _ramp(idx, 100, 0.05)
+    monkeypatch.setattr(strategy_xs, "LOOKBACK", 5)
+    monkeypatch.setattr(strategy_xs, "SKIP", 1)
+    monkeypatch.setattr(bx, "TOP_N", 2)
+    reb = set(bx.rebalance_dates(idx))
+    port, benchc, log, turnover, sp, sb = bx._simulate_xs(panel, bench, reb)
+    assert len(log) >= 2
+    assert all(len(codes) == 2 for _, codes in log)
+    assert all("A.XSHG" in codes for _, codes in log)      # 最强恒被选
+    assert all("C.XSHG" not in codes for _, codes in log)  # 最弱不入选
+    assert port.iloc[-1] > 0 and len(port) == len(idx)
+    port2, *_ = bx._simulate_xs(panel, bench, reb)
+    assert list(port) == list(port2)                       # 确定性
