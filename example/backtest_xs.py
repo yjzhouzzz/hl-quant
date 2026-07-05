@@ -64,3 +64,65 @@ def rebalance_dates(trading_days: list[pd.Timestamp]) -> list[pd.Timestamp]:
             seen.add(key)
             out.append(d)
     return out
+
+
+_TENCENT_PAGE = 800
+_TENCENT_MAX_PAGES = 30
+
+
+def _rows_to_ohlc(rows: list, start: str, end: str) -> pd.DataFrame:
+    """腾讯 kline 行 [date,open,close,high,low,vol] → 去重排序后的 open/close 表。"""
+    acc: dict[str, tuple] = {}
+    for r in rows:
+        acc[r[0]] = (float(r[1]), float(r[2]))     # date -> (open, close)
+    if not acc:
+        return pd.DataFrame(columns=["date", "open", "close"])
+    df = pd.DataFrame(
+        [{"date": pd.to_datetime(d), "open": o, "close": c} for d, (o, c) in acc.items()]
+    ).sort_values("date").reset_index(drop=True)
+    return df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+
+
+def _fetch_ohlc(symbol: str) -> pd.DataFrame:
+    """分页拉取单个腾讯符号的多年前复权日线，返回 open/close 表。"""
+    rows: list = []
+    end = END_DATE
+    for _ in range(_TENCENT_MAX_PAGES):
+        page = _fetch_page(symbol, end, _TENCENT_PAGE)
+        if not page:
+            break
+        rows = page + rows
+        earliest = page[0][0]
+        if earliest <= START_DATE:
+            break
+        end = earliest
+    return _rows_to_ohlc(rows, START_DATE, END_DATE)
+
+
+def load_panel() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """拉取股票池面板 + 基准，优先读缓存。
+
+    返回 (panel, bench)：panel = {code: OHLC表(date/open/close)}；bench = 基准 OHLC 表。
+    缺口股票（停牌久/次新不足）保留其可得区间，撮合时按日期对齐处理。
+    """
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache = CACHE_DIR / f"panel_csi300_{SNAPSHOT_DATE}_{START_DATE}_{END_DATE}.pkl"
+    if cache.exists():
+        obj = pd.read_pickle(cache)
+        return obj["panel"], obj["bench"]
+
+    bench = _fetch_ohlc("sh000300")  # 指数 000300 非 6/5 开头，不走 _tencent_symbol
+    if bench.empty:
+        raise SystemExit("基准 sh000300 未取到数据，停止（数据源阻塞）。")
+
+    panel: dict[str, pd.DataFrame] = {}
+    for code in CSI300:
+        df = _fetch_ohlc(_tencent_symbol(code))
+        if not df.empty:
+            panel[code] = df
+    if len(panel) < 0.8 * len(CSI300):
+        raise SystemExit(
+            f"仅取到 {len(panel)}/{len(CSI300)} 只，疑似接口受限，停止（勿用残缺池）。"
+        )
+    pd.to_pickle({"panel": panel, "bench": bench}, cache)
+    return panel, bench

@@ -29,3 +29,15 @@ def test_rebalance_dates_first_trading_day_of_month():
     ]).tolist()
     got = bx.rebalance_dates(days)
     assert got == pd.to_datetime(["2020-01-02", "2020-02-03", "2020-03-02"]).tolist()
+
+
+def test_rows_to_ohlc_dedup_and_sort():
+    rows = [
+        ["2020-01-03", "1.1", "1.2", "1.3", "1.0", "100"],
+        ["2020-01-02", "1.0", "1.05", "1.1", "0.9", "100"],
+        ["2020-01-03", "1.1", "1.25", "1.3", "1.0", "100"],  # 同日重复，后者覆盖
+    ]
+    df = bx._rows_to_ohlc(rows, "2020-01-01", "2020-12-31")
+    assert list(df["date"].dt.strftime("%Y-%m-%d")) == ["2020-01-02", "2020-01-03"]
+    assert df.iloc[1]["close"] == 1.25   # 去重取后者
+    assert df.iloc[0]["open"] == 1.0
