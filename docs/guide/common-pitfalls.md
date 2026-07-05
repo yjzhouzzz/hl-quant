@@ -70,3 +70,24 @@ bar**（次日开盘或次日收盘），否则本地分数天然虚高、无法
 
 **已固化**：`example/backtest.py` `_simulate`（次日开盘撮合 + 整手 + 滑点）；
 `scripts/export_jq.py` 幂等门控模板。
+
+## 3. 横截面 v2 外部数据源间歇不可用
+
+**现象**：`scripts/fetch_universe.py` 报 EastMoney「Empty reply」；`load_panel()` /
+`_fetch_page` 报腾讯 HTTP 501；全窗口基线跑不通。
+
+**根因**：
+
+- EastMoney `push2.eastmoney.com` 在部分网络/沙箱环境直接断连；
+- 腾讯财经 kline 接口有频控/临时 501，批量拉 300 股时更易触发；
+- 沪深300 指数在腾讯侧符号为 `sh000300`，不能用 `_tencent_symbol("000300.XSHG")`
+  （会误映射为 `sz000300`）。
+
+**标准解法**：
+
+- **成分快照**：`fetch_universe.py` 已内置新浪 `hs300` 分页备用源（EastMoney 失败时
+  自动降级）；仍失败则**停止**，不要手编清单。
+- **基准符号**：`backtest_xs.load_panel` 基准固定用 `"sh000300"`。
+- **面板缓存**：首次成功拉取后写入 `example/.cache/panel_csi300_*.pkl`，后续读缓存；
+  501 期间无缓存则基线登记阻塞，等接口恢复再跑 `python backtest_xs.py`。
+- **终验**：本地数据源阻塞不影响聚宽 `jq_strategy_xs_export.py` point-in-time 终验。

@@ -56,3 +56,30 @@
 - **Replay（holdout run-once，方向性）**：样本内 score −0.247→0.012（大亏→打平）；holdout 0.854→0.825（牛市段几乎无代价）；`train − holdout score = −0.81`（验证段更好），无过拟合迹象。
 - **Decide**：**ACCEPT**。亏损转盈利、回撤大降、全门槛通过、样本内外方向一致。
 - **Compress**：趋势过滤为唯一新增规则，无冗余。
+
+---
+
+# 横截面 v2 评估器（沪深300 / 月度 Top3 / IR）
+
+固定评估口径：`universe_csi300.py` 固定快照（2026-07-05，300 只），腾讯前复权日线，2018-01-01 ~ 2026-02-28，初始 10 万，次日开盘/整手/滑点/成本，`score = IR`（相对 sh000300 超额的信息比率）。**只改 `example/strategy_xs.py`，`backtest_xs.py` 冻结。**
+
+设计文档：`docs/design/cross-sectional-pipeline.md`（两级验收门槛：迭代宽进 / 部署严出）。
+
+## v2 基础设施交付（2026-07-05，feat/xs-pipeline）
+
+- **状态**：评估器代码闭环完成（Task 0–9），harness 9 项 pytest + py_compile + 双 export --check 全绿。
+- **策略基线**：12-1 横截面动量（`LOOKBACK=252`, `SKIP=21`），等权 Top3，月度调仓。
+- **聚宽终验**：`example/jq_strategy_xs_export.py`（`get_index_stocks` point-in-time 成分）。
+
+## ⚠️ 基线数值待锚定（数据源阻塞）
+
+全窗口 / holdout 基线 IR **尚未登记**——2026-07-05 执行时腾讯财经 kline 接口返回 HTTP 501，无法完成 `load_panel()` 300 股拉取与 smoke。EastMoney 在本环境亦不可用（已降级新浪生成成分快照）。
+
+**解除阻塞后执行**（在 `example/` 目录）：
+
+```bash
+python backtest_xs.py            # 全窗口 → 登记 IR 等为基线锚点
+python backtest_xs.py --holdout  # 样本内 vs 尾部 holdout
+```
+
+登记后在此节补表，并将两级门槛中「严格 > 基线」落成具体 IR 数值。

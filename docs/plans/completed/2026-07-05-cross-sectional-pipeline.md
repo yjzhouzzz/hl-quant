@@ -1,5 +1,7 @@
 # 横截面选股 v2 评估器 实现计划
 
+> **状态（2026-07-05）**：Task 0–9 ✅ 已交付（commit `bff7a95`）；Task 10 基线数值登记 ⏸ 阻塞（腾讯 API 501，见 `hl-ledger.md`）。计划已归档至 `completed/`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现。步骤用 `- [ ]` 复选框跟踪。
 
 **Goal:** 交付一台物理隔离、口径冻结、可复现的横截面固定评估器 v2，让 HL 只改 `strategy_xs.py` 的 `score()` 即可迭代沪深300 月度等权 Top3 选股，按信息比率(IR)超额打分，并能导出聚宽 point-in-time 终验脚本。
