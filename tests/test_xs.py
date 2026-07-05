@@ -80,3 +80,16 @@ def test_simulate_xs_selects_top_and_is_deterministic(monkeypatch):
     assert port.iloc[-1] > 0 and len(port) == len(idx)
     port2, *_ = bx._simulate_xs(panel, bench, reb)
     assert list(port) == list(port2)                       # 确定性
+
+
+def test_xs_metrics_basic():
+    idx = pd.bdate_range("2021-01-01", periods=252).tolist()
+    port = pd.Series([100000 * (1.0006 ** i) for i in range(len(idx))], index=idx)
+    bench = pd.Series([100000 * (1.0002 ** i) for i in range(len(idx))], index=idx)
+    m = bx._compute_xs_metrics(port, bench, [], 0.0, port.iloc[0], bench.iloc[0], {})
+    assert m.score > 0                    # IR 正（组合日日跑赢基准）
+    assert m.ann_excess > 0
+    assert 0.9 <= m.monthly_win <= 1.0
+    assert m.t_stat > 0
+    assert 0.0 <= m.top_contrib <= 1.0
+    assert m.n_holdings == 0

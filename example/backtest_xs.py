@@ -245,3 +245,66 @@ def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
     return (pd.Series(port_curve, index=idx_scoring),
             pd.Series(bench_curve, index=idx_scoring), holdings_log,
             turnover_total, start_port, start_bench)
+
+
+def _close_asof(df: pd.DataFrame, d) -> float | None:
+    """取 df 中 date ≤ d 的最后一个 close；无则 None。"""
+    sub = df[df["date"] <= d]
+    return float(sub["close"].iloc[-1]) if len(sub) else None
+
+
+def _compute_xs_metrics(port: pd.Series, bench: pd.Series, holdings_log: list,
+                        turnover_total: float, start_port: float,
+                        start_bench: float, panel: dict) -> XSMetrics:
+    port_ret = port.pct_change().dropna()
+    bench_ret = bench.pct_change().dropna()
+    excess = (port_ret - bench_ret).dropna()
+
+    n = len(port)
+    years = n / TRADING_DAYS_PER_YEAR if n else 0.0
+    ex_std = float(excess.std())
+    ir = (float(excess.mean()) / ex_std * math.sqrt(TRADING_DAYS_PER_YEAR)) if ex_std > 0 else 0.0
+    t_stat = ir * math.sqrt(years) if years > 0 else 0.0
+    ann_excess = float(excess.mean()) * TRADING_DAYS_PER_YEAR
+
+    # 相对净值线（组合/基准，各自归一）→ 超额最大回撤
+    rel = (port / start_port) / (bench / start_bench)
+    run_max = rel.cummax()
+    excess_maxdd = float(-((rel - run_max) / run_max).min()) if len(rel) else 0.0
+
+    # 月度胜率
+    pm = port.resample("ME").last().pct_change().dropna()
+    bm = bench.resample("ME").last().pct_change().dropna()
+    monthly_win = float((pm > bm).mean()) if len(pm) else 0.0
+
+    # 年化换手（单边，粗略）
+    avg_val = float(port.mean()) if len(port) else INITIAL_CASH
+    turnover = (turnover_total / avg_val / years) if (avg_val > 0 and years > 0) else 0.0
+
+    # 有效持仓次数 + 单只×单期超额贡献（等权、close-to-close 近似）
+    n_holdings = sum(len(codes) for _, codes in holdings_log)
+    contribs: list[float] = []
+    for k, (d, codes) in enumerate(holdings_log):
+        end = holdings_log[k + 1][0] if k + 1 < len(holdings_log) else port.index[-1]
+        b0, b1 = _bench_asof(bench, d), _bench_asof(bench, end)
+        bret = (b1 / b0 - 1.0) if (b0 and b1) else 0.0
+        for c in codes:
+            df = panel.get(c)
+            if df is None:
+                continue
+            p0, p1 = _close_asof(df, d), _close_asof(df, end)
+            if p0 and p1 and len(codes):
+                contribs.append(((p1 / p0 - 1.0) - bret) / len(codes))
+    pos = [x for x in contribs if x > 0]
+    top_contrib = (max(pos) / sum(pos)) if pos else 0.0
+
+    return XSMetrics(
+        score=ir, ann_excess=ann_excess, excess_maxdd=excess_maxdd,
+        monthly_win=monthly_win, t_stat=t_stat, turnover=turnover,
+        n_holdings=n_holdings, top_contrib=top_contrib,
+    )
+
+
+def _bench_asof(bench: pd.Series, d) -> float | None:
+    sub = bench.loc[:d]
+    return float(sub.iloc[-1]) if len(sub) else None
