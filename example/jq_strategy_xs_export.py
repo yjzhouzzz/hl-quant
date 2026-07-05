@@ -15,7 +15,7 @@ TOP_N = 3
 # ============================================================
 # 以下为从 strategy_xs.py 自动注入的策略核心，请勿手工改动
 # ============================================================
-LOOKBACK = 252          # 需要的已完成日线数（约12个月），引擎/聚宽据此取数
+LOOKBACK = 126          # 需要的已完成日线数（约6个月），引擎/聚宽据此取数
 SKIP = 21               # 跳过最近约1个月（规避短期反转）
 
 
@@ -28,7 +28,7 @@ def score(history: dict) -> dict:
         if len(closes) < LOOKBACK:
             continue
         p_recent = float(closes.iloc[-SKIP])       # 约1个月前
-        p_old = float(closes.iloc[-LOOKBACK])      # 约12个月前
+        p_old = float(closes.iloc[-LOOKBACK])      # 约6个月前
         if p_old > 0:
             out[code] = p_recent / p_old - 1.0
     return out
