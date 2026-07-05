@@ -17,6 +17,7 @@ TOP_N = 3
 # ============================================================
 LOOKBACK = 252          # 需要的已完成日线数（约12个月），引擎/聚宽据此取数
 SKIP = 21               # 跳过最近约1个月（规避短期反转）
+TREND_WINDOW = 200      # 长期趋势过滤：只做仍在长期上升趋势中的个股
 
 
 def score(history: dict) -> dict:
@@ -26,6 +27,10 @@ def score(history: dict) -> dict:
     for code, df in history.items():
         closes = df["close"].reset_index(drop=True)
         if len(closes) < LOOKBACK:
+            continue
+        ma_trend = float(closes.iloc[-TREND_WINDOW:].mean())
+        price = float(closes.iloc[-1])
+        if price <= ma_trend:
             continue
         p_recent = float(closes.iloc[-SKIP])       # 约1个月前
         p_old = float(closes.iloc[-LOOKBACK])      # 约12个月前

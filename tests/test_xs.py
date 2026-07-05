@@ -36,7 +36,8 @@ def test_momentum_score_ranks_and_filters():
     short = up.iloc[-10:].reset_index(drop=True)
     s = strategy_xs.score({"A.XSHG": up, "B.XSHG": flat, "C.XSHG": short})
     assert "C.XSHG" not in s
-    assert s["A.XSHG"] > s["B.XSHG"]
+    assert "B.XSHG" not in s
+    assert s["A.XSHG"] > 0
 
 
 def test_rebalance_dates_first_trading_day_of_month():
