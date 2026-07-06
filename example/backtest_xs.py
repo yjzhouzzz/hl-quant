@@ -275,8 +275,14 @@ def load_panel() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
     return panel, bench
 
 
+def _limit_prices(prev_close: float) -> tuple[float, float]:
+    """A 股普通股 10% 涨跌停近似口径。"""
+    return round(prev_close * 1.10, 2), round(prev_close * 0.90, 2)
+
+
 def _order_value(cash: float, positions: dict, code: str,
-                 target_val: float, ref_open: float) -> tuple[float, float]:
+                 target_val: float, ref_open: float,
+                 prev_close: float | None = None) -> tuple[float, float]:
     """把 code 的持仓按目标市值 target_val 调整（次日开盘价 ref_open，含滑点/整手/成本）。
     返回 (更新后现金, 本次成交名义额)。target_val=0 即清仓。"""
     cur = positions.get(code, 0.0)
@@ -284,6 +290,10 @@ def _order_value(cash: float, positions: dict, code: str,
     traded = 0.0
     if target_val < cur_val:                       # 卖到目标
         price = ref_open * (1 - SLIPPAGE / 2)
+        if prev_close is not None:
+            _, lower = _limit_prices(prev_close)
+            if price < lower:                      # 近似模拟跌停卖不出
+                return cash, traded
         lots = min(int((cur_val - target_val) / (ref_open * LOT_SIZE)), int(cur / LOT_SIZE))
         if lots > 0:
             qty = lots * LOT_SIZE
@@ -297,6 +307,10 @@ def _order_value(cash: float, positions: dict, code: str,
                 positions.pop(code, None)
     elif target_val > cur_val:                     # 买到目标
         price = ref_open * (1 + SLIPPAGE / 2)
+        if prev_close is not None:
+            upper, _ = _limit_prices(prev_close)
+            if price > upper:                      # 近似模拟涨停/滑点穿涨停买不进
+                return cash, traded
         budget = min(target_val - cur_val, cash)
         lots = int(budget / (price * LOT_SIZE * (1 + COMMISSION_RATE)))
         while lots > 0:
@@ -313,13 +327,17 @@ def _order_value(cash: float, positions: dict, code: str,
 
 
 def _rebalance(cash: float, positions: dict, targets: list[str],
-               open_prices: dict) -> tuple[float, dict, float]:
+               open_prices: dict,
+               prev_closes: dict[str, float] | None = None) -> tuple[float, dict, float]:
     """调仓到等权目标名单：先清出局者，再按等权目标市值减超配、加欠配。
     停牌（open 缺失）者无法成交则保留原状。返回 (现金, 持仓, 成交名义额)。"""
     traded = 0.0
+    prev_closes = prev_closes or {}
     for code in list(positions):                   # a) 清出不在目标里的
         if code not in targets and code in open_prices:
-            cash, tn = _order_value(cash, positions, code, 0.0, open_prices[code])
+            cash, tn = _order_value(
+                cash, positions, code, 0.0, open_prices[code], prev_closes.get(code)
+            )
             traded += tn
     tradable = [c for c in targets if c in open_prices]
     if not tradable:
@@ -328,17 +346,22 @@ def _rebalance(cash: float, positions: dict, targets: list[str],
     tv = total / len(tradable)
     for code in tradable:                          # b) 先减超配（释放现金）
         if positions.get(code, 0.0) * open_prices[code] > tv:
-            cash, tn = _order_value(cash, positions, code, tv, open_prices[code])
+            cash, tn = _order_value(
+                cash, positions, code, tv, open_prices[code], prev_closes.get(code)
+            )
             traded += tn
     for code in tradable:                          # c) 再加欠配
         if positions.get(code, 0.0) * open_prices[code] < tv:
-            cash, tn = _order_value(cash, positions, code, tv, open_prices[code])
+            cash, tn = _order_value(
+                cash, positions, code, tv, open_prices[code], prev_closes.get(code)
+            )
             traded += tn
     return cash, positions, traded
 
 
 def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
-                 warmup_days: int = 0) -> tuple:
+                 warmup_days: int = 0,
+                 start_index: int = 0) -> tuple:
     """逐日模拟月度等权 Top-N：调仓日前一交易日收盘选股 → 调仓日开盘成交 → 每日收盘估值。
 
     这样与聚宽 `run_monthly(..., time="open") + previous_date` 对齐：在月初第一个交易日
@@ -362,9 +385,13 @@ def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
     turnover_total = 0.0
     start_port = INITIAL_CASH
     start_bench = bclose[cal[0]]
+    scoring_start = max(warmup_days, start_index)
 
     for i, d in enumerate(cal):
-        if d in rebalance_set and i > 0:           # 1) 今开调仓：信号只用昨收前已知信息
+        if i < start_index:
+            continue
+        should_rebalance = (d in rebalance_set) or (i == start_index and start_index > 0)
+        if should_rebalance and i > 0:             # 1) 今开调仓：信号只用昨收前已知信息
             signal_date = cal[i - 1]
             universe = _pit_constituents_at(signal_date)
             hist = {
@@ -378,8 +405,13 @@ def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
             targets = targets[:TOP_N]
             names = set(list(positions) + targets)
             op = {c: popen[c][d] for c in names if d in popen.get(c, {})}
-            cash, positions, tv = _rebalance(cash, positions, targets, op)
-            if i >= warmup_days:
+            prev = {
+                c: _close_asof(panel[c], signal_date)
+                for c in names
+                if c in panel
+            }
+            cash, positions, tv = _rebalance(cash, positions, targets, op, prev)
+            if i >= scoring_start:
                 turnover_total += tv
                 if targets:
                     holdings_log.append((d, list(targets)))
@@ -387,13 +419,13 @@ def _simulate_xs(panel: dict, bench: pd.DataFrame, rebalance_set: set,
             if d in pclose.get(c, {}):
                 last_close[c] = pclose[c][d]
         pv = cash + sum(sh * last_close.get(c, 0.0) for c, sh in positions.items())
-        if i == warmup_days:
+        if i == scoring_start:
             start_port = pv
             start_bench = bclose[d]
-        if i >= warmup_days:
+        if i >= scoring_start:
             port_curve.append(pv)
             bench_curve.append(bclose[d])
-    idx_scoring = cal[warmup_days:]                # 计分段日期索引（供月度重采样）
+    idx_scoring = cal[scoring_start:]              # 计分段日期索引（供月度重采样）
     return (pd.Series(port_curve, index=idx_scoring),
             pd.Series(bench_curve, index=idx_scoring), holdings_log,
             turnover_total, start_port, start_bench)

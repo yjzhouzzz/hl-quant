@@ -177,6 +177,86 @@ def test_simulate_xs_executes_on_rebalance_day_open(monkeypatch):
     assert port.loc[pd.Timestamp("2020-02-03")] > bx.INITIAL_CASH
 
 
+def test_simulate_xs_fresh_start_ignores_prior_rebalances(monkeypatch):
+    idx = pd.to_datetime(["2020-01-02", "2020-01-31", "2020-02-03", "2020-02-04"]).tolist()
+    panel = {
+        "A.XSHG": pd.DataFrame({"date": idx, "open": [10, 10, 20, 20], "close": [10, 20, 21, 21]}),
+        "B.XSHG": pd.DataFrame({"date": idx, "open": [10, 10, 50, 50], "close": [10, 10, 50, 50]}),
+    }
+    bench = pd.DataFrame({"date": idx, "open": [100] * 4, "close": [100] * 4})
+
+    monkeypatch.setattr(bx, "TOP_N", 1)
+    monkeypatch.setattr(
+        strategy_xs,
+        "score",
+        lambda hist: {code: float(df["close"].iloc[-1]) for code, df in hist.items()},
+    )
+    monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
+
+    _, _, log, _, _, _ = bx._simulate_xs(
+        panel,
+        bench,
+        {pd.Timestamp("2020-01-02"), pd.Timestamp("2020-02-03")},
+        start_index=2,
+    )
+
+    assert log == [(pd.Timestamp("2020-02-03"), ["A.XSHG"])]
+
+
+def test_simulate_xs_fresh_start_trades_on_arbitrary_start_day(monkeypatch):
+    idx = pd.to_datetime(["2020-07-08", "2020-07-09", "2020-08-03"]).tolist()
+    panel = {
+        "A.XSHG": pd.DataFrame({"date": idx, "open": [10, 10, 10], "close": [10, 20, 20]}),
+        "B.XSHG": pd.DataFrame({"date": idx, "open": [10, 10, 10], "close": [10, 10, 10]}),
+    }
+    bench = pd.DataFrame({"date": idx, "open": [100] * 3, "close": [100] * 3})
+
+    monkeypatch.setattr(bx, "TOP_N", 1)
+    monkeypatch.setattr(
+        strategy_xs,
+        "score",
+        lambda hist: {code: float(df["close"].iloc[-1]) for code, df in hist.items()},
+    )
+    monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
+
+    _, _, log, _, _, _ = bx._simulate_xs(
+        panel,
+        bench,
+        {pd.Timestamp("2020-08-03")},
+        start_index=1,
+    )
+
+    assert log[0][0] == pd.Timestamp("2020-07-09")
+
+
+def test_rebalance_cancels_buy_when_price_hits_limit_up():
+    cash = 100000.0
+    positions = {}
+    targets = ["A.XSHG"]
+    open_prices = {"A.XSHG": 11.0}
+    prev_closes = {"A.XSHG": 10.0}
+
+    cash2, pos2, traded = bx._rebalance(cash, positions, targets, open_prices, prev_closes)
+
+    assert cash2 == cash
+    assert pos2 == {}
+    assert traded == 0.0
+
+
+def test_rebalance_does_not_open_sub_lot_position():
+    cash = 0.0
+    positions = {"A.XSHG": 100.0}
+    targets = ["A.XSHG", "B.XSHG"]
+    open_prices = {"A.XSHG": 198.0, "B.XSHG": 500.0}
+    prev_closes = {"A.XSHG": 198.0, "B.XSHG": 500.0}
+
+    cash2, pos2, traded = bx._rebalance(cash, positions, targets, open_prices, prev_closes)
+
+    assert "B.XSHG" not in pos2
+    assert pos2["A.XSHG"] == 100.0
+    assert traded == 0.0
+
+
 def test_simulate_xs_respects_point_in_time_universe(monkeypatch):
     idx = pd.to_datetime(["2020-01-30", "2020-01-31", "2020-02-03", "2020-02-04"]).tolist()
     panel = {
