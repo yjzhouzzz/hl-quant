@@ -19,6 +19,7 @@ STRATEGY_FILE = ROOT / "example" / "strategy_xs.py"
 BACKTEST_FILE = ROOT / "example" / "backtest_xs.py"
 OUTPUT_FILE = ROOT / "example" / "jq_strategy_xs_export.py"
 TECH50_FILE = ROOT / "example" / "universe_tech50.py"
+SNAPSHOT_FILE = ROOT / "example" / "factor_snapshot_tech50.py"
 
 CORE_START = "# >>> STRATEGY CORE >>>"
 CORE_END = "# <<< STRATEGY CORE <<<"
@@ -37,6 +38,7 @@ import pandas as pd
 BENCHMARK = "000300.XSHG"
 TOP_N = {top_n}
 TECH50 = {tech50}
+FACTOR_SNAPSHOT = {factor_snapshot}
 
 # ============================================================
 # 以下为从 strategy_xs.py 自动注入的策略核心，请勿手工改动
@@ -108,8 +110,24 @@ def read_tech50() -> str:
     return repr(sorted(set(tech50)))
 
 
+def read_factor_snapshot() -> str:
+    ns = {}
+    exec(SNAPSHOT_FILE.read_text(encoding="utf-8"), ns)
+    snap = ns.get("FACTOR_SNAPSHOT")
+    if not snap:
+        raise SystemExit(
+            f"{SNAPSHOT_FILE} 未生成或 FACTOR_SNAPSHOT 为空，请先运行 python scripts/fetch_factor_snapshot_tech50.py"
+        )
+    return repr(snap)
+
+
 def render() -> str:
-    return TEMPLATE.format(top_n=read_top_n(), tech50=read_tech50(), core=extract_core())
+    return TEMPLATE.format(
+        top_n=read_top_n(),
+        tech50=read_tech50(),
+        factor_snapshot=read_factor_snapshot(),
+        core=extract_core(),
+    )
 
 
 def main() -> None:

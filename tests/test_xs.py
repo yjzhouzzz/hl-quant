@@ -8,6 +8,7 @@ from pathlib import Path
 
 from example import universe_csi300 as uni
 from example import universe_tech50 as tech50
+from example import factor_snapshot_tech50 as factor_snap
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,6 +32,13 @@ def test_tech50_snapshot_valid():
     assert all(not code.startswith("688") for code in tech50.TECH50)
 
 
+def test_factor_snapshot_valid():
+    assert factor_snap.FACTOR_SNAPSHOT_DATE
+    assert set(factor_snap.FACTOR_SNAPSHOT) == set(tech50.TECH50)
+    sample = factor_snap.FACTOR_SNAPSHOT[tech50.TECH50[0]]
+    assert {"roe", "pe"} <= set(sample)
+
+
 import pandas as pd
 import backtest_xs as bx
 import strategy_xs
@@ -42,9 +50,18 @@ def test_momentum_score_ranks_and_filters():
     up = pd.DataFrame({"date": idx, "open": 1.0, "close": [1.0 + i * 0.01 for i in range(n)]})
     flat = pd.DataFrame({"date": idx, "open": 1.0, "close": [1.0] * n})
     short = up.iloc[-10:].reset_index(drop=True)
-    s = strategy_xs.score({"A.XSHG": up, "B.XSHG": flat, "C.XSHG": short})
-    assert "C.XSHG" not in s
-    assert s["A.XSHG"] > s["B.XSHG"]
+    old = strategy_xs.FACTOR_SNAPSHOT
+    strategy_xs.FACTOR_SNAPSHOT = {
+        "A.XSHG": {"roe": 20.0, "pe": 10.0},
+        "B.XSHG": {"roe": 5.0, "pe": 40.0},
+        "C.XSHG": {"roe": 30.0, "pe": 8.0},
+    }
+    try:
+        s = strategy_xs.score({"A.XSHG": up, "B.XSHG": flat, "C.XSHG": short})
+        assert "C.XSHG" not in s
+        assert s["A.XSHG"] > s["B.XSHG"]
+    finally:
+        strategy_xs.FACTOR_SNAPSHOT = old
 
 
 def test_rebalance_dates_first_trading_day_of_month():
@@ -82,19 +99,28 @@ def test_simulate_xs_selects_top_and_is_deterministic(monkeypatch):
         "C.XSHG": _ramp(idx, 10, 0.02),   # 最弱
     }
     bench = _ramp(idx, 100, 0.05)
+    old = strategy_xs.FACTOR_SNAPSHOT
     monkeypatch.setattr(strategy_xs, "LOOKBACK", 5)
     monkeypatch.setattr(strategy_xs, "SKIP", 1)
     monkeypatch.setattr(bx, "TOP_N", 2)
     monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
     reb = set(bx.rebalance_dates(idx))
-    port, benchc, log, turnover, sp, sb = bx._simulate_xs(panel, bench, reb)
-    assert len(log) >= 2
-    assert all(len(codes) == 2 for _, codes in log)
-    assert all("A.XSHG" in codes for _, codes in log)      # 最强恒被选
-    assert all("C.XSHG" not in codes for _, codes in log)  # 最弱不入选
-    assert port.iloc[-1] > 0 and len(port) == len(idx)
-    port2, *_ = bx._simulate_xs(panel, bench, reb)
-    assert list(port) == list(port2)                       # 确定性
+    strategy_xs.FACTOR_SNAPSHOT = {
+        "A.XSHG": {"roe": 20.0, "pe": 10.0},
+        "B.XSHG": {"roe": 10.0, "pe": 20.0},
+        "C.XSHG": {"roe": 5.0, "pe": 40.0},
+    }
+    try:
+        port, benchc, log, turnover, sp, sb = bx._simulate_xs(panel, bench, reb)
+        assert len(log) >= 2
+        assert all(len(codes) == 2 for _, codes in log)
+        assert all("A.XSHG" in codes for _, codes in log)      # 最强恒被选
+        assert all("C.XSHG" not in codes for _, codes in log)  # 最弱不入选
+        assert port.iloc[-1] > 0 and len(port) == len(idx)
+        port2, *_ = bx._simulate_xs(panel, bench, reb)
+        assert list(port) == list(port2)                       # 确定性
+    finally:
+        strategy_xs.FACTOR_SNAPSHOT = old
 
 
 def test_simulate_xs_uses_previous_day_signal_on_rebalance_open(monkeypatch):
@@ -242,14 +268,24 @@ def test_run_backtest_on_synthetic(monkeypatch):
         "C.XSHG": _ramp(idx, 10, 0.05), "D.XSHG": _ramp(idx, 10, 0.01),
     }
     bench = _ramp(idx, 100, 0.05)
+    old = strategy_xs.FACTOR_SNAPSHOT
     monkeypatch.setattr(strategy_xs, "LOOKBACK", 5)
     monkeypatch.setattr(strategy_xs, "SKIP", 1)
     monkeypatch.setattr(bx, "TOP_N", 2)
     monkeypatch.setattr(bx, "_pit_constituents_at", lambda d: set(panel), raising=False)
-    m = bx.run_backtest(panel=panel, bench=bench)
-    assert isinstance(m, bx.XSMetrics)
-    assert math.isfinite(m.score)
-    assert m.n_holdings > 0
+    strategy_xs.FACTOR_SNAPSHOT = {
+        "A.XSHG": {"roe": 20.0, "pe": 10.0},
+        "B.XSHG": {"roe": 10.0, "pe": 20.0},
+        "C.XSHG": {"roe": 5.0, "pe": 40.0},
+        "D.XSHG": {"roe": 1.0, "pe": 80.0},
+    }
+    try:
+        m = bx.run_backtest(panel=panel, bench=bench)
+        assert isinstance(m, bx.XSMetrics)
+        assert math.isfinite(m.score)
+        assert m.n_holdings > 0
+    finally:
+        strategy_xs.FACTOR_SNAPSHOT = old
 
 
 def test_export_jq_xs_render_and_check():
@@ -261,5 +297,6 @@ def test_export_jq_xs_render_and_check():
     assert "TOP_N = 5" in out                   # 与 backtest_xs 同步
     assert "startswith('688')" in out          # 非科创板过滤同步到聚宽终验
     assert "TECH50 = [" in out                 # 科技50白名单同步到聚宽终验
+    assert "FACTOR_SNAPSHOT = {" in out        # 多因子快照同步到聚宽终验
     r = subprocess.run([py, "scripts/export_jq_xs.py", "--check"], cwd=_ROOT)
     assert r.returncode == 0                    # 漂移检查通过
