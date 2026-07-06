@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from example import universe_csi300 as uni
+from example import universe_tech50 as tech50
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -21,6 +22,13 @@ def test_universe_snapshot_valid():
     pat = re.compile(r"^\d{6}\.(XSHG|XSHE)$")
     assert all(pat.match(c) for c in uni.CSI300)
     assert re.match(r"^\d{4}-\d{2}-\d{2}$", uni.SNAPSHOT_DATE)
+
+
+def test_tech50_snapshot_valid():
+    assert len(tech50.TECH50) == 50
+    assert len(set(tech50.TECH50)) == 50
+    assert all(code in uni.CSI300 for code in tech50.TECH50)
+    assert all(not code.startswith("688") for code in tech50.TECH50)
 
 
 import pandas as pd
@@ -179,18 +187,39 @@ def test_simulate_xs_respects_point_in_time_universe(monkeypatch):
 
 def test_pit_constituents_at_excludes_star_board():
     old = bx._pit_history_cache
+    old_tech = bx.TECH50
     bx._pit_history_cache = pd.DataFrame({
         "symbol": ["SH688256", "SZ000001"],
         "name": ["寒武纪-U", "平安银行"],
         "opt-in": pd.to_datetime(["2023-12-08", "2005-04-08"]),
         "opt-out": pd.to_datetime([None, None]),
     })
+    bx.TECH50 = {"000001.XSHE", "688256.XSHG"}
     try:
         got = bx._pit_constituents_at(pd.Timestamp("2024-11-01"))
         assert "000001.XSHE" in got
         assert "688256.XSHG" not in got
     finally:
         bx._pit_history_cache = old
+        bx.TECH50 = old_tech
+
+
+def test_pit_constituents_at_respects_tech50_whitelist():
+    old_hist = bx._pit_history_cache
+    old_tech = getattr(bx, "TECH50", None)
+    bx._pit_history_cache = pd.DataFrame({
+        "symbol": ["SZ000001", "SZ000063"],
+        "name": ["平安银行", "中兴通讯"],
+        "opt-in": pd.to_datetime(["2005-04-08", "2005-04-08"]),
+        "opt-out": pd.to_datetime([None, None]),
+    })
+    bx.TECH50 = {"000063.XSHE"}
+    try:
+        got = bx._pit_constituents_at(pd.Timestamp("2024-11-01"))
+        assert got == {"000063.XSHE"}
+    finally:
+        bx._pit_history_cache = old_hist
+        bx.TECH50 = old_tech
 
 
 def test_xs_metrics_basic():
@@ -229,7 +258,8 @@ def test_export_jq_xs_render_and_check():
     out = (_ROOT / "example" / "jq_strategy_xs_export.py").read_text(encoding="utf-8")
     assert "get_index_stocks" in out          # point-in-time 成分
     assert "def score" in out                  # 核心已注入
-    assert "TOP_N = 3" in out                   # 与 backtest_xs 同步
+    assert "TOP_N = 5" in out                   # 与 backtest_xs 同步
     assert "startswith('688')" in out          # 非科创板过滤同步到聚宽终验
+    assert "TECH50 = [" in out                 # 科技50白名单同步到聚宽终验
     r = subprocess.run([py, "scripts/export_jq_xs.py", "--check"], cwd=_ROOT)
     assert r.returncode == 0                    # 漂移检查通过

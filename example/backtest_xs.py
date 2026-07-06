@@ -24,6 +24,7 @@ import pandas as pd
 
 import strategy_xs
 from backtest import _fetch_page, _tencent_symbol  # 复用腾讯拉取（只读，不改单标的版）
+from universe_tech50 import TECH50, TECH50_SNAPSHOT_DATE
 from universe_csi300 import SNAPSHOT_DATE
 
 # ============================================================
@@ -35,7 +36,7 @@ END_DATE = "2026-02-28"
 INITIAL_CASH = 100_000.0
 TRADING_DAYS_PER_YEAR = 252
 
-TOP_N = 3                          # 等权持有前 N 名
+TOP_N = 5                          # 等权持有前 N 名
 HOLDOUT_FRAC = 0.20               # 尾部 holdout 比例
 
 COMMISSION_RATE = 0.0003
@@ -204,7 +205,7 @@ def _pit_union_codes() -> list[str]:
         {
             code
             for code in (_pit_symbol_to_code(sym) for sym in hist.loc[mask, "symbol"])
-            if _allow_user_market(code)
+            if _allow_user_market(code) and code in TECH50
         }
     )
 
@@ -217,13 +218,13 @@ def _pit_constituents_at(date) -> set[str]:
     return {
         code
         for code in (_pit_symbol_to_code(sym) for sym in hist.loc[mask, "symbol"])
-        if _allow_user_market(code)
+        if _allow_user_market(code) and code in TECH50
     }
 
 
 def _panel_cache_paths() -> tuple[Path, Path]:
     """返回 (最终缓存, 增量缓存) 路径。"""
-    stem = f"panel_csi300_pit_{START_DATE}_{END_DATE}"
+    stem = f"panel_tech50_top{TOP_N}_pit_{TECH50_SNAPSHOT_DATE}_{START_DATE}_{END_DATE}"
     return CACHE_DIR / f"{stem}.pkl", CACHE_DIR / f"{stem}_partial.pkl"
 
 

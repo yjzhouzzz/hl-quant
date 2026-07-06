@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STRATEGY_FILE = ROOT / "example" / "strategy_xs.py"
 BACKTEST_FILE = ROOT / "example" / "backtest_xs.py"
 OUTPUT_FILE = ROOT / "example" / "jq_strategy_xs_export.py"
+TECH50_FILE = ROOT / "example" / "universe_tech50.py"
 
 CORE_START = "# >>> STRATEGY CORE >>>"
 CORE_END = "# <<< STRATEGY CORE <<<"
@@ -35,6 +36,7 @@ import pandas as pd
 
 BENCHMARK = "000300.XSHG"
 TOP_N = {top_n}
+TECH50 = {tech50}
 
 # ============================================================
 # 以下为从 strategy_xs.py 自动注入的策略核心，请勿手工改动
@@ -55,7 +57,10 @@ def initialize(context):
 
 def rebalance(context):
     date = context.previous_date
-    universe = [c for c in get_index_stocks(BENCHMARK, date=date) if not c.startswith('688')]
+    universe = [
+        c for c in get_index_stocks(BENCHMARK, date=date)
+        if (not c.startswith('688')) and (c in TECH50)
+    ]
     hist = {{}}
     for code in universe:
         df = attribute_history(code, LOOKBACK, '1d', ['close'], skip_paused=True)
@@ -94,8 +99,17 @@ def read_top_n() -> str:
     return m.group(1)
 
 
+def read_tech50() -> str:
+    ns = {}
+    exec(TECH50_FILE.read_text(encoding="utf-8"), ns)
+    tech50 = ns.get("TECH50")
+    if not tech50:
+        raise SystemExit(f"{TECH50_FILE} 未生成或 TECH50 为空，请先检查手工白名单文件。")
+    return repr(sorted(set(tech50)))
+
+
 def render() -> str:
-    return TEMPLATE.format(top_n=read_top_n(), core=extract_core())
+    return TEMPLATE.format(top_n=read_top_n(), tech50=read_tech50(), core=extract_core())
 
 
 def main() -> None:
