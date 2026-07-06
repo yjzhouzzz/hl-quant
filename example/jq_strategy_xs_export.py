@@ -19,6 +19,7 @@ FACTOR_SNAPSHOT = {'000063.XSHE': {'roe': 1.72, 'pe': 32.67}, '000100.XSHE': {'r
 # ============================================================
 LOOKBACK = 252          # 需要的已完成日线数（约12个月），引擎/聚宽据此取数
 SKIP = 21               # 跳过最近约1个月（规避短期反转）
+VOL_WINDOW = 63         # 近约3个月日收益波动，用作稳定性因子
 
 
 def score(history: dict) -> dict:
@@ -43,6 +44,7 @@ def score(history: dict) -> dict:
                     "roe": float(snap.get("roe", 0.0)),
                     "ep": ep,
                     "mom": p_recent / p_old - 1.0,
+                    "vol": closes.iloc[-VOL_WINDOW:].pct_change().dropna().std(),
                 }
             )
     if not rows:
@@ -52,7 +54,8 @@ def score(history: dict) -> dict:
     df["roe_rank"] = df["roe"].rank(pct=True, ascending=True).fillna(0.5)
     df["ep_rank"] = df["ep"].rank(pct=True, ascending=True).fillna(0.0)
     df["mom_rank"] = df["mom"].rank(pct=True, ascending=True).fillna(0.0)
-    df["score"] = df["roe_rank"] + df["ep_rank"] + df["mom_rank"]
+    df["vol_rank"] = (-df["vol"]).rank(pct=True, ascending=True).fillna(0.5)
+    df["score"] = df["roe_rank"] + df["ep_rank"] + df["mom_rank"] + df["vol_rank"]
     return dict(zip(df["code"], df["score"]))
 # ============================================================
 
